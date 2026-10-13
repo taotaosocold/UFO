@@ -412,43 +412,58 @@ def init_wandb(cfg: TrainConfig):
 
 class Workspace:
     def __init__(self, cfg: TrainConfig) -> None:
+        # 传入一个TrainConfig配置对象cfg，把训练配置保存到实例上，之后所有的方法
+        # 都可以通过self.cfg.agent或者self.cfg.env等方法访问配置
         self.cfg = cfg
+        # 保存分布式训练信息，包括当前rank和总的rank数，比如8个gpu就是8个rank编号
         self.distributed_rank = int(self.cfg.distributed_rank)
+        # 保存参与训练的进程总数
         self.distributed_world_size = int(self.cfg.distributed_world_size)
+        # 决定当前进程是否负责写公共文件和日志，如果是rank0_only_writes为True，就rank0写日志和文件，否则不写
+        # 否则如果配置为false，所有rank都会写日志和文件
         self._write_shared_artifacts = (not self.cfg.rank0_only_writes) or self.distributed_rank == 0
 
         # MJLab environments are created once and shared with evaluation.
+        # 如果配置环境是HumanoidVerseMjlabConfig类型，就创建训练环境和训练环境信息，并保存观测空间和动作空间
+        # 默认配置就是这个环境类型
         if isinstance(cfg.env, HumanoidVerseMjlabConfig):
             from omegaconf import OmegaConf
-
+            # 根据环境配置创建并行环境，返回两个对象，一个是训练环境对象，一个是训练环境附加信息对象
             self.train_env, self.train_env_info = cfg.env.build(num_envs=cfg.online_parallel_envs)
+            # 取得单个环境的观测空间描述，就是描述观测有哪些字段以及每个字段的形状和类型
+            # 实际观测得调用reset()或step()方法获得
+            # 当前配置的观测字段包括state、privileged_state、last_action
+            # history_actor、time
             self.obs_space = self.train_env.single_observation_space
+            # 取得单个环境的动作空间描述
             self.action_space = self.train_env.single_action_space
         else:
             sample_env, _ = cfg.env.build(num_envs=1)
             self.obs_space = sample_env.observation_space
             self.action_space = sample_env.action_space
-
+        # 要求单环境动作是一维向量，也就是没有batch这东西
         assert "time" in self.obs_space.keys(), "Observation space must contain 'obs' and 'time' (TimeAwareObservation wrapper)"
         assert len(self.action_space.shape) == 1, "Only 1D action space is supported (first dim should be vector env)"
         # TODO for backwards consistency, we do not pass "time" to the agent, so we remove it from the obs_space we pass to the agent/model
         #      but would we need it at some point?
+        # 去除其中的“times”字段，因为这部分观测不会扔给网络
         del self.obs_space.spaces["time"]
 
         self.action_dim = self.action_space.shape[0]
 
         print(f"Workdir: {self.cfg.work_dir}")
+        # 把路径转换成Path对象，方便拼接路径创建目录
         self.work_dir = Path(self.cfg.work_dir)
         self.work_dir.mkdir(exist_ok=True, parents=True)
-
+        # 如果当前进程负责公共输出，而且使用MJLab，就保存环境配置
         if self._write_shared_artifacts and isinstance(cfg.env, HumanoidVerseMjlabConfig):
             with open(self.work_dir / "config.yaml", "w") as file:
                 OmegaConf.save(self.train_env_info["unresolved_conf"], file)
-
+        # 如果当前进程允许写公共输出，就创建CSV日志记录器，否则设为None
         self.train_logger = CSVLogger(filename=self.work_dir / TRAIN_LOG_FILENAME) if self._write_shared_artifacts else None
-
+        # 设置随机种子
         set_seed_everywhere(self.cfg.seed)
-
+        # 得到的self.agent就是算法实例，self.cfg就是配置对象
         self.agent, self.cfg, self._checkpoint_status = create_agent_or_load_checkpoint(
             self.work_dir, self.cfg, agent_build_kwargs=dict(obs_space=self.obs_space, action_dim=self.action_dim)
         )
@@ -493,7 +508,7 @@ class Workspace:
         if self.cfg.checkpoint_rank_buffers and self.distributed_world_size > 1:
             return checkpoint_dir / "buffers" / f"train_rank_{self.distributed_rank}"
         return checkpoint_dir / "buffers" / "train"
-
+    # 启动训练
     def train(self):
         self.start_time = time.time()
         self.train_online()
@@ -554,8 +569,10 @@ class Workspace:
             return metrics
 
     def train_online(self) -> None:
+        # 判断这次训练是否需要专家数据，当前的配置是训练的时候需要专家数据
         if self.training_with_expert_data:
             if self.cfg.load_expert_data_from_motion_lib:
+                # 判断是否从环境的运动裤MotionLib中加载专家轨迹
                 expert_buffer = load_expert_trajectories_from_motion_lib(self.train_env._env, self.cfg.agent, device=self.cfg.buffer_device)
             else:
                 raise RuntimeError(
@@ -574,6 +591,8 @@ class Workspace:
         replay_buffer = {}
         checkpoint_dir = self.work_dir / CHECKPOINT_DIR_NAME
         checkpoint_buffer_dir = self._checkpoint_buffer_path(checkpoint_dir)
+        # 加载replay_buffer, 这里的replay_buffer是一个字典，里面有train和expert_slicer两个键
+        # 其中训练时用的放到replay_buffer["train"]，专家数据放到replay_buffer["expert_slicer"]
         if checkpoint_buffer_dir.exists():
             print("Loading checkpointed buffer")
             if self.cfg.use_trajectory_buffer:
@@ -614,12 +633,23 @@ class Workspace:
                 f"trajectory_steps_per_rank={_trajectory_steps_per_rank(self.cfg)}, "
                 f"compile={self.cfg.agent.compile}"
             )
+        # 初始化进度条和环境观测
+        # 当前td通常是
+        # {
+        #     "state": numpy数组,
+        #     "privileged_state": numpy数组,
+        #     "last_action": numpy数组,
+        #     "history_actor": numpy数组,
+        #     "time": numpy数组,
+        # }
         progb = tqdm(
             total=self.cfg.num_env_steps,
             initial=min(self._checkpoint_global_time, self.cfg.num_env_steps),
             disable=self.cfg.disable_tqdm,
         )
+        # 重置环境，获得td，这个td就是观测
         td, info = train_env.reset()
+        # 如果启用了异常数值检查，那么其检查td中是否有非有限值（NaN或Inf）
         if self.cfg.fail_on_nonfinite:
             _assert_finite(
                 td,
@@ -630,6 +660,8 @@ class Workspace:
                 optimizer_steps=self._optimizer_steps,
             )
         # see https://farama.org/Vector-Autoreset-Mode
+        # 初始化结束标记，包括每个环境是否真正终止，初始为false
+        # 以及每个环境是否截断初始为false
         terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
         truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
         done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
@@ -641,13 +673,16 @@ class Workspace:
         eval_time_checker = EveryNStepsChecker(self._checkpoint_global_time, self.cfg.eval_every_steps)
         update_agent_time_checker = EveryNStepsChecker(self._checkpoint_local_time, self.cfg.update_agent_every)
         log_time_checker = EveryNStepsChecker(self._checkpoint_global_time, self.cfg.log_every_updates)
-
+        # 检查是否存在MJLAB跟踪评估器
         eval_instances = []
+        # 遍历评估器名称
         for evaluation_name in self.evaluations.keys():
+            # 取得对应评估器
             evaluation = self.evaluations[evaluation_name]
             eval_instances.append(isinstance(evaluation, HumanoidVerseMjlabTrackingEvaluation))
+        # 只要存在一个MJLab跟踪评估器，就设为true
         uses_humanoidverse_eval = True if any(eval_instances) else False
-
+        # 训练循环，处理预算和检查点
         for local_time in range(self._checkpoint_local_time, max_local_time + local_step_increment, local_step_increment):
             global_time = local_time * global_step_scale
             if global_time > self.cfg.num_env_steps:
@@ -658,10 +693,11 @@ class Workspace:
 
             if global_time >= self.cfg.num_env_steps:
                 break
-
+            # 判断是否需要评估
             if (self.evaluate and eval_time_checker.check(global_time)) or (
                 self.evaluate and global_time == self._checkpoint_global_time
             ):
+                # 初始化评估结果
                 eval_metrics = {}
                 run_eval_on_this_rank = (not self.cfg.distributed_sync) or self.distributed_rank == 0
                 if run_eval_on_this_rank:
@@ -669,9 +705,12 @@ class Workspace:
                 if self.cfg.distributed_sync:
                     barrier()
                 eval_time_checker.update_last_step(global_time)
+                # 如果是评估阶段，就走这段代码
                 if uses_humanoidverse_eval:
                     # reset if there is a humanoidverse evaluation
+                    # 重新重置训练环境，重新获得训练初始观测td
                     td, info = train_env.reset()
+                    # 依旧如果开启异常检测，则检查观测是否有出现Naf之类的问题
                     if self.cfg.fail_on_nonfinite:
                         _assert_finite(
                             td,
@@ -684,20 +723,24 @@ class Workspace:
                     terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
                     truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
                     done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
-
+                # 如果开启优先采样时，根据评估结果更新动作权重
                 if self.cfg.prioritization:
                     # priorities
+                    # 初始化等待同步的权重数据
                     priority_payload = None
                     if run_eval_on_this_rank:
+                        # 检查评估动作数量与专家动作数量一致
                         assert len(eval_metrics[self.priorization_eval_name]) == len(replay_buffer["expert_slicer"].motion_ids), (
                             "Mismatch in number of motions returned by the eval"
                         )
+                        # 创建动作 ID 到索引、文件名的映射
                         index_in_buffer, name_in_buffer = {}, {}
                         for i, motion_id in enumerate(replay_buffer["expert_slicer"].motion_ids):
                             index_in_buffer[motion_id] = i
                             if hasattr(replay_buffer["expert_slicer"], "file_names"):
                                 name_in_buffer[motion_id] = replay_buffer["expert_slicer"].file_names[i]
                         motions_id, priorities, idxs = [], [], []
+                        # 把跟踪误差转换成采样权重
                         for _, metr in eval_metrics[self.priorization_eval_name].items():
                             motions_id.append(metr["motion_id"])
                             priorities.append(metr["emd"])
@@ -731,6 +774,7 @@ class Workspace:
                         }
                     if self.cfg.distributed_sync:
                         priority_payload = broadcast_object(priority_payload, src=0)
+                    # 同步并应用新的采样权重
                     if priority_payload is None:
                         raise RuntimeError("Prioritization requires evaluation metrics, but no priority payload was produced.")
                     priorities = priority_payload["priorities"].to(self.agent.device)
@@ -753,12 +797,15 @@ class Workspace:
                         f"num_env_steps_global={self.cfg.num_env_steps}"
                     )
                 break
-
+            # 采集动作时不建立梯度计算图
             with torch.no_grad():
+                # 根据前面获得的观测td值转到tensor上并取名为obs
+                # 这个obs是一个字典，包括的key有state、privileged_state、history_actor、time等，都是tensor类型
                 obs = tree_map(lambda x: torch.tensor(x, dtype=dtype_numpytotorch_lower_precision(x.dtype), device=self.agent.device), td)
                 # TODO consistency with obs_space: remove time assigned by TimeAwareObservationWrapper
+                # 将其中的time键从obs中移除，并赋值给step_count
                 step_count = obs.pop("time")
-
+                # 默认没有独立历史编码
                 history_context = None
                 if "history" in obs:
                     # this works in inference mode
@@ -768,19 +815,29 @@ class Workspace:
                         history_context = self.agent.history_inference(obs=obs["history"]["observation"], action=obs["history"]["action"])[
                             :, -1
                         ].clone()
-
+                # 首次调用的时候context是None，FB会为每个环境采样一个归一化的随机z
+                # 后续调用的时候每个环境按自己的step_count和obs来更新自己的context
+                # 这个context就是归一化后采样的z形状为[N,z_dim]
+                # 也就是这里是用上一轮使用的任务向量和每个环境当前episode也就是step_count
+                # 以及replay_buffer来获得任务向量z
                 context = self.agent.maybe_update_rollout_context(z=context, step_count=step_count, replay_buffer=replay_buffer)
+                # 当local_time小于num_seed_steps时，先用随机动作收集初始数据
+                # 也就是训练初期，动作是随机探索得到的
                 if local_time < self.cfg.num_seed_steps:
+                    # 先用随机动作收集初始数据
                     action = train_env.action_space.sample().astype(np.float32)
                 else:
+                    # 后续就是由actor网络获得，actor网络输入obs和z
                     # this works in inference mode
                     if history_context is not None:
                         action = self.agent.act(obs=obs, z=context, context=history_context, mean=False)
                     else:
                         action = self.agent.act(obs=obs, z=context, mean=False)
                     # TODO a bit hard-coded -- just to avoid moving stuff from cpu to cuda
+                    # Tensor动作从gpu传给cpu变成numpy，准备传给环境
                     if isinstance(self.cfg.env, HumanoidVerseMjlabConfig):
                         action = action.cpu().detach().numpy()
+                # 判断本论是否检查异常数值
                 check_rollout_nonfinite = (
                     self.cfg.fail_on_nonfinite
                     and self.cfg.nonfinite_check_rollout_every_local_steps > 0
@@ -819,7 +876,9 @@ class Workspace:
                         global_time=global_time,
                         optimizer_steps=self._optimizer_steps,
                     )
+            # 执行动作，推进环境，从action得到新的观测td、奖励、终止标记、截断标记和info
             new_td, new_reward, new_terminated, new_truncated, new_info = train_env.step(action)
+            # 检查恶道的新的观测和奖励是否有异常
             if check_rollout_nonfinite:
                 _assert_finite(
                     new_td,
@@ -839,6 +898,7 @@ class Workspace:
                 )
 
             # we check if at the next iteration we will evaluate
+            # 提前处理下一轮评估的轨迹边界
             next_local_time = local_time + local_step_increment
             next_global_time = next_local_time * global_step_scale
             if (self.evaluate and eval_time_checker.check(next_global_time)) or (
@@ -849,8 +909,9 @@ class Workspace:
                     # after the evaluation. This is because we share the environment with the evaluation
                     new_truncated = np.ones_like(new_truncated, dtype=bool)
                     truncated = np.ones_like(new_truncated, dtype=bool)
-
+            # 检查gymnasium版本，构造轨迹数据
             if Version(gymnasium.__version__) >= Version("1.0"):
+                # 如果有使用轨迹缓冲区
                 if self.cfg.use_trajectory_buffer:
                     data = {
                         "observation": tree_map(lambda x: x[None, ...], obs),
@@ -871,16 +932,17 @@ class Workspace:
                         data["qvel"] = info["qvel"][None, ...]
                     if "aux_rewards" in new_info:
                         data["aux_rewards"] = {k: v[None, ..., None] for k, v in new_info["aux_rewards"].items() if not k.startswith("_")}
+                # 如果没有使用轨迹缓冲区，那么使用普通缓冲区
                 else:
                     # We add only transitions corresponding to environments that have not reset in the previous step.
                     # For environments that have reset in the previous step, the new observation corresponds to the state after reset.
                     indexes = ~done
-
+                    # float64 降为 float32，再筛选有效环境
                     real_next_obs = tree_map(lambda x: x.astype(np.float32 if x.dtype == np.float64 else x.dtype)[indexes], new_td)
                     # TODO again, we need to remove "time" from the observation (to stay consistent with obs_space)
                     _ = real_next_obs.pop("time")
                     _ = real_next_obs.pop("history", None)
-
+                    # 普通缓冲区分支就得显示构造转移
                     data = {
                         "observation": tree_map(lambda x: x[indexes], obs),
                         "action": action[indexes],
@@ -919,12 +981,17 @@ class Workspace:
                     optimizer_steps=self._optimizer_steps,
                 )
             replay_buffer["train"].extend(data)
-
+            # 判断是否更新网络，必须满足三哪个条件，首先缓冲区必须非空
+            # 并且超过了初始随机探索阶段，必须到达算法更新间隔
             if len(replay_buffer["train"]) > 0 and local_time > self.cfg.num_seed_steps and update_agent_time_checker.check(local_time):
+                # 记录这次更新触发的位置
                 update_agent_time_checker.update_last_step(local_time)
+                # 连续执行配置数量的算法更新
                 for _ in range(self.cfg.num_agent_updates):
+                    # 从缓冲区采样，计算损失，反向传播并更新网络参数，返回指标
                     metrics = self.agent.update(replay_buffer, local_time)
                     self._optimizer_steps += 1
+                    # 对指标进行检查看看数值是否异常
                     if self.cfg.fail_on_nonfinite:
                         _assert_finite(
                             metrics,
@@ -945,6 +1012,7 @@ class Workspace:
                                 global_time=global_time,
                                 optimizer_steps=self._optimizer_steps,
                             )
+                    # 同步模型统计量，累计训练指标
                     if self.cfg.distributed_sync:
                         sync_floating_buffers(self.agent._model)
                     if self.cfg.distributed_sync and self.cfg.distributed_average_metrics:
@@ -954,9 +1022,11 @@ class Workspace:
                         metric_update_counts,
                         metrics,
                     )
-
+            # 达到日志间隔时计算平均指标
             if log_time_checker.check(global_time) and total_metrics is not None:
+                # 记录本次日志进度
                 log_time_checker.update_last_step(global_time)
+                # 创建最终输出的日志字典
                 m_dict = {}
                 for k in sorted(list(total_metrics.keys())):
                     tmp = total_metrics[k] / metric_update_counts[k]
@@ -991,10 +1061,13 @@ class Workspace:
                 m_dict["local_timestep"] = local_time
                 if self.train_logger is not None:
                     self.train_logger.log(m_dict)
-
+            # 把新观测变成下一轮的当前观测
             progb.update(global_step_increment)
+            # 下一轮使用这次环境返回的新观测
             td = new_td
+            # 下一轮保留这次返回的终止标记
             terminated = new_terminated
+            # 下一轮保留这次返回的截断标记
             truncated = new_truncated
             done = np.logical_or(new_terminated.ravel(), new_truncated.ravel())
             info = new_info

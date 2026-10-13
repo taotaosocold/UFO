@@ -213,7 +213,9 @@ class FBAgent:
             dist = self._model._actor(obs, z, self._model.cfg.actor_std)
             action = dist.sample(clip=self.cfg.train.stddev_clip)
         return action
-
+    # 传入的数据包括obs是训练的时候环境交互得到的观测，action就是所执行的动作
+    # next_obs就是得到的下一个观测，goal其实是和next_obs一个值，z就是任务向量
+    # q_loss_coef是Q损失权重，这里默认没有，clip_grad_norm是梯度裁减，也默认没有
     def update_fb(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
@@ -225,22 +227,33 @@ class FBAgent:
         q_loss_coef: float | None,
         clip_grad_norm: float | None,
     ) -> Dict[str, torch.Tensor]:
+        # 进入可选的混合精度计算环境
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
             with torch.no_grad():
                 # dist = self._model._actor(next_obs, z, self._model.cfg.actor_std)
                 # next_action = dist.sample(clip=self.cfg.train.stddev_clip)
+                # 用当前actor，根据下一个观测和任务向量生成动作
                 next_action = self.sample_action_from_norm_obs(next_obs, z)
+                # 用target的F网络编码下一个状态和动作
                 target_Fs = self._model._target_forward_map(next_obs, z, next_action)  # num_parallel x batch x z_dim
+                # 再用target的B网络编码状态
                 target_B = self._model._target_backward_map(goal)  # batch x z_dim
+                # 计算两者的内积得到M网络
                 target_Ms = torch.matmul(target_Fs, target_B.T)  # num_parallel x batch x batch
                 _, _, target_M = self.get_targets_uncertainty(target_Ms, self.cfg.train.fb_pessimism_penalty)  # batch x batch
 
             # compute FB loss
+            # 前向推理得到F值和B值，F为[E,batch_size,z_dim]
             Fs = self._model._forward_map(obs, z, action)  # num_parallel x batch x z_dim
             B = self._model._backward_map(goal)  # batch x z_dim
+            # F*B得到后记测度
             Ms = torch.matmul(Fs, B.T)  # num_parallel x batch x batch
-
+            # Ms的形状为为[E,batch_size,batch_size]其中E为2表示并行F网络数量，其中E不用管
+            # 而第一个batch_size就表示当前环境(s,a)，第二个batch_size到达状态的goal
+            # M值就是后继测度，也就是拜访折扣次数
+            # discount的形状为[K,1],target_M的形状为[K,K]
             diff = Ms - discount * target_M  # num_parallel x batch x batch
+            # 计算非对角FB损失
             fb_offdiag = 0.5 * (diff * self.off_diag).pow(2).sum() / self.off_diag_sum
             fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
             fb_loss = fb_offdiag + fb_diag
@@ -353,17 +366,29 @@ class FBAgent:
             end_idx = min(step + self.cfg.model.seq_length, traj_length)
             z[:, step] = z[:, step:end_idx].mean(dim=1)
         return self._model.project_z(z)  # N x T x z_dim
-
+    # 返回的context就是归一化后的z，传入上一轮的z和当前的step_count，判断是否需要更新z
+    # 如果需要就从缓冲区采样或者重新采样新的z
+    # 这里z=[N,z_dim]，step_count=[N,1]，replay_buffer是轨迹缓冲区
     def maybe_update_rollout_context(self, z: torch.Tensor | None, step_count: torch.Tensor, replay_buffer: None = None) -> torch.Tensor:
         # get mask for environmets where we need to change z
+        # 说明之前已经生成过任务向量，那么就判断是否需要更新任务向量
         if z is not None:
+            # 这里判断每个环境的部署是否为更新间隔的整数倍，假设更新间隔为100
+            # 然后step_count=[[0],[23],[100],[151]]
+            # 那么得到的mask_reset_z=[[True],[False],[True],[False]]，表示第0个和第2个环境需要更新任务向量
             mask_reset_z = step_count % self.cfg.train.update_z_every_step == 0
+            # 如果同时满足允许从混合任务向量缓冲区采样，并且z_buffer已经有数据
+            # 那么新的z就从z_buffer中采样，注意z_buffer是不同于replay_buffer的缓冲区
             if self.cfg.train.use_mix_rollout and not self.z_buffer.empty():
                 new_z = self.z_buffer.sample(z.shape[0], device=self._model.device)
             else:
+                # 不然就调用函数直接从模型中采样新的任务向量
                 new_z = self._model.sample_z(z.shape[0], device=self._model.device)
             z = torch.where(mask_reset_z, new_z, z.to(self._model.device))
+            # z总共有三种来源，第一种是从模型中采样，第二种是从混合任务向量缓冲区采样也就是z_buffer
+            # 第三种是从轨迹缓冲区采样，也就是专家运动序列也就是replay_buffer["expert_slicer"]
             if self.cfg.train.rollout_expert_trajectories:
+                # 计算每个环境当前对应专家轨迹中的哪个时间位置
                 idxs = step_count % self.cfg.train.rollout_expert_trajectories_length
                 if torch.any(idxs == 0):
                     n_elem = int(self.cfg.train.rollout_expert_trajectories_percentage*step_count.shape[0])

@@ -80,25 +80,30 @@ class FBcprAuxAgent(FBcprAgent):
             from tensordict.nn import CudaGraphModule
 
             self.update_aux_critic = CudaGraphModule(self.update_aux_critic, warmup=5)
-
+    # 返回的是一个字典包含损失、价值预测均值等
     def update(self, replay_buffer, step: int) -> Dict[str, torch.Tensor]:
+        # 从专家缓冲区采样batch_size条数据，默认配置是1024
         expert_batch = replay_buffer["expert_slicer"].sample(self.cfg.train.batch_size)
+        # 在从训练的交互在线缓冲区采样batch_size条数据
         train_batch = replay_buffer["train"].sample(self.cfg.train.batch_size)
-
+        # 取出在线观测和动作，移动到训练设备
         train_obs, train_action, train_next_obs = (
             tree_map(lambda x: x.to(self.device), train_batch["observation"]),
             train_batch["action"].to(self.device),
             tree_map(lambda x: x.to(self.device), train_batch["next"]["observation"]),
         )
+        # 先获得下一个观测的终止条件是bool的tensor，然后取反，然后计算折扣因子
+        # 最后如果下一个观测是终止状态，那么折扣因子就为0，否则就是cfg.train.discount
         discount = self.cfg.train.discount * ~train_batch["next"]["terminated"].to(self.device)
+        # 取出专家的当前和下一观测，分别为expert_obs和expert_next_obs
         expert_obs, expert_next_obs = (
             tree_map(lambda x: x.to(self.device), expert_batch["observation"]),
             tree_map(lambda x: x.to(self.device), expert_batch["next"]["observation"]),
         )
-
+        # 这两行调用归一化器，但没有保存返回值
         self._model._obs_normalizer(train_obs)
         self._model._obs_normalizer(train_next_obs)
-
+        # 这里才真正的返回归一化的值覆盖，并且不加入梯度计算图，包括在线交互的数据以及专家数据
         with torch.no_grad(), eval_mode(self._model._obs_normalizer):
             train_obs, train_next_obs = (
                 self._model._obs_normalizer(train_obs),
@@ -108,13 +113,16 @@ class FBcprAuxAgent(FBcprAgent):
                 self._model._obs_normalizer(expert_obs),
                 self._model._obs_normalizer(expert_next_obs),
             )
-
+        # 为编译器的 CUDA Graph 执行标记一个新步骤边界
         torch.compiler.cudagraph_mark_step_begin()
+        # 通过B编码专家下一个状态得到了向量z，以及从replay_buffer的train批次中取出的z向量
         expert_z = self.encode_expert(next_obs=expert_next_obs)
         train_z = train_batch["z"].to(self.device)
 
         # train the discriminator
+        # 更新判别器，这里如果配置值大于零时，启用判别器梯度惩罚，否则设为None表示不启用
         grad_penalty = self.cfg.train.grad_penalty_discriminator if self.cfg.train.grad_penalty_discriminator > 0 else None
+        # 更新判别器
         metrics = self.update_discriminator(
             expert_obs=expert_obs,
             expert_z=expert_z,
@@ -122,17 +130,22 @@ class FBcprAuxAgent(FBcprAgent):
             train_z=train_z,
             grad_penalty=grad_penalty,
         )
-
+        # 构建新的混合任务向量，这个z是为这次训练生成batch_size个候选任务向量
+        # 其中任务向量有三个来源，第一部分就是随机生成的z，第二部分是专家通过B模型编码得到的z
+        # 第三部分是从replay_buffer采样得到的z，也就是过去拿去训练过的z
         z = self.sample_mixed_z(train_goal=train_next_obs, expert_encodings=expert_z).clone()
+        # 将这批混合任务向量存入z_buffer，供之后环境交互时采样使用
         self.z_buffer.add(z)
-
+        # 如果配置了任务重新标记比例，就为每条样本生成一个[0,1)的随机数，并与比例比较
+        # 比如如果relable_ratio=0.8则百分之八十的条目为true，也就是使用新任务z，false的保留采样时的train_z
         if self.cfg.train.relabel_ratio is not None:
             mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) <= self.cfg.train.relabel_ratio
             train_z = torch.where(mask, z, train_z)
-
+        # q_loss_coef表示是否在FB网络更新的时候加入额外的Q损失，当前默认是不添加
         q_loss_coef = self.cfg.train.q_loss_coef if self.cfg.train.q_loss_coef > 0 else None
+        # 确定是否进行梯度裁减，目前是选择不裁减
         clip_grad_norm = self.cfg.train.clip_grad_norm if self.cfg.train.clip_grad_norm > 0 else None
-
+        # 更新FB网络
         metrics.update(
             self.update_fb(
                 obs=train_obs,
@@ -145,6 +158,7 @@ class FBcprAuxAgent(FBcprAgent):
                 clip_grad_norm=clip_grad_norm,
             )
         )
+        # 更新判别器的critic网络，这里使用的是多critic网络
         metrics.update(
             self.update_critic(
                 obs=train_obs,
@@ -166,7 +180,7 @@ class FBcprAuxAgent(FBcprAgent):
             aux_reward += self.cfg.aux_rewards_scaling[aux_reward_name] * train_batch["aux_rewards"][aux_reward_name].to(self.device)
 
         aux_reward = self._model._aux_reward_normalizer(aux_reward)
-
+        # 更新辅助奖励的critic网络
         metrics.update(
             self.update_aux_critic(
                 obs=train_obs,
@@ -177,6 +191,7 @@ class FBcprAuxAgent(FBcprAgent):
                 z=train_z,
             )
         )
+        # 更新actor网络
         metrics.update(
             self.update_actor(
                 obs=train_obs,
@@ -185,7 +200,7 @@ class FBcprAuxAgent(FBcprAgent):
                 clip_grad_norm=clip_grad_norm,
             )
         )
-
+        # 软更新target网络
         with torch.no_grad():
             _soft_update_params(
                 self._forward_map_paramlist,

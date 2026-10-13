@@ -82,8 +82,11 @@ class FBModel(BaseModel):
         self.amp_dtype = torch.bfloat16
 
         # create networks
+        # B网络，输入观测obs，输出z_dim维的潜在向量
         self._backward_map = arch.b.build(obs_space, arch.z_dim)
+        # F网络，输入obs和z_dim维的潜在向量，输出action_dim维的动作
         self._forward_map = arch.f.build(obs_space, arch.z_dim, action_dim)
+        # actor网络，输入obs和z_dim维的潜在向量，输出动作分布
         self._actor = arch.actor.build(obs_space, arch.z_dim, action_dim)
         self._obs_normalizer = self.cfg.obs_normalizer.build(obs_space)
 

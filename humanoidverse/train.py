@@ -289,11 +289,13 @@ def _init_distributed(local_rank: int, world_size: int) -> None:
             init_kwargs.pop("device_id", None)
             dist.init_process_group(**init_kwargs)
 
-
+# 启动训练的函数
 def run_train(args: argparse.Namespace, log_dir: Path) -> None:
     device, _local_rank, rank, world_size = _select_device_and_rank(args.seed)
     _init_distributed(_local_rank, world_size)
     seed = args.seed + rank
+    # 配置训练参数,包括设备，工作目录，环境数量，环境步数，随机种子，是否使用wandb等
+    # 这里cfg是一个TrainConfig对象,包含了训练所需的所有配置参数
     cfg = build_ufo_mjlab_config(
         device=device,
         work_dir=str(log_dir),
@@ -334,7 +336,9 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         flush=True,
     )
     try:
+        # 调用cfg.build()方法去构建一个Workspace类的实例workspace
         workspace = cfg.build()
+        # 启动训练
         workspace.train()
     finally:
         if world_size > 1:
@@ -366,6 +370,7 @@ def launch(args: argparse.Namespace) -> None:
         else:
             selected_gpus = [str(i) for i in requested]
         num_gpus = len(selected_gpus)
+    # 如果gpu数量小于1,那么直接执行run_train去开启训练
     if num_gpus <= 1:
         if selected_gpus is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(selected_gpus)
@@ -378,6 +383,7 @@ def launch(args: argparse.Namespace) -> None:
     if selected_gpus is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(selected_gpus)
     os.environ.setdefault("TORCHRUNX_LOG_DIR", str(log_dir / "torchrunx"))
+    # 如果gpu数量大于1,那么使用torchrunx.Launcher去开启训练
     torchrunx.Launcher(
         hostnames=["localhost"],
         workers_per_host=num_gpus,
