@@ -216,6 +216,7 @@ class FBAgent:
     # 传入的数据包括obs是训练的时候环境交互得到的观测，action就是所执行的动作
     # next_obs就是得到的下一个观测，goal其实是和next_obs一个值，z就是任务向量
     # q_loss_coef是Q损失权重，这里默认没有，clip_grad_norm是梯度裁减，也默认没有
+    # 这里核心是在更新F和B网络，核心公式为M(s_t,a_t,g)=1(s_t+1==g)+\gamma*M(s_t+1,a_t+1,g)
     def update_fb(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
@@ -228,44 +229,75 @@ class FBAgent:
         clip_grad_norm: float | None,
     ) -> Dict[str, torch.Tensor]:
         # 进入可选的混合精度计算环境
+        # 这段代码本质上就是在给折扣访问网络M去做一个TD误差的损失，后面来详细讲解
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
             with torch.no_grad():
                 # dist = self._model._actor(next_obs, z, self._model.cfg.actor_std)
                 # next_action = dist.sample(clip=self.cfg.train.stddev_clip)
-                # 用当前actor，根据下一个观测和任务向量生成动作
+                # 首先从下一个状态和z去采样对应的下一个动作action
                 next_action = self.sample_action_from_norm_obs(next_obs, z)
-                # 用target的F网络编码下一个状态和动作
+                # 这里我们先不用在意用的是_target_forwawrd_map还是_forward_map，这里先理解得到的是
+                # 由下一个状态和下一个动作得到的F网络
                 target_Fs = self._model._target_forward_map(next_obs, z, next_action)  # num_parallel x batch x z_dim
-                # 再用target的B网络编码状态
+                # 这里goal就是目标，其实就是next_obs，也就是对目标进行编码的得到B网络
                 target_B = self._model._target_backward_map(goal)  # batch x z_dim
-                # 计算两者的内积得到M网络
+                # 然后两者内积得到M网络也就是，M(next_obs,next_action,goal)
+                # 也就是下一个状态执行下一个动作到达状态goal的折扣访问次数
+                # 这里得到的为[2, K, K]，2是两个target网络，K是环境的数量，其实就里面每个值表示
+                # 当前的环境到达那个环境的未来折扣次数
                 target_Ms = torch.matmul(target_Fs, target_B.T)  # num_parallel x batch x batch
+                # 这里其实是TD3的思想，就是设置两个target网络然后取均值或者最小通过保守估计减少高估
+                # 就是TD3的双critic相似的思路
                 _, _, target_M = self.get_targets_uncertainty(target_Ms, self.cfg.train.fb_pessimism_penalty)  # batch x batch
 
             # compute FB loss
-            # 前向推理得到F值和B值，F为[E,batch_size,z_dim]
+            # 计算当前观测执行当前动作的F网络，以及同样到达goal目标的B网络
             Fs = self._model._forward_map(obs, z, action)  # num_parallel x batch x z_dim
             B = self._model._backward_map(goal)  # batch x z_dim
-            # F*B得到后记测度
+            # F*B得到后继测度M也就是M(obs,action,goal)也就是当前观测执行当前动作action到达goal的未来折扣次数
             Ms = torch.matmul(Fs, B.T)  # num_parallel x batch x batch
             # Ms的形状为为[E,batch_size,batch_size]其中E为2表示并行F网络数量，其中E不用管
             # 而第一个batch_size就表示当前环境(s,a)，第二个batch_size到达状态的goal
             # M值就是后继测度，也就是拜访折扣次数
             # discount的形状为[K,1],target_M的形状为[K,K]
+            # 举一个例子，状态A->动作a->状态B>动作b->状态C->结束，然后discount=0.9
+            # 那么我们希望的就是M(A,a,B)=1，M(B,b,C)=1，M(A,a,C)=0.9*M(B,b,C)=0.9,而M(B,b,B)=0
             diff = Ms - discount * target_M  # num_parallel x batch x batch
-            # 计算非对角FB损失
+            # 计算非对角FB损失，这里self.off_diag和self.off_diag_sum都是默认配置，其中
+            # self.off_diag是一个[K, K]大小的矩阵，对角线为0,非对角线为1,而self.off_diag_sum就是
+            # self.off_diag之和也就是K*K-K=1047552
+            # 这里乘以0.5是系数这个不用管，这个其实有没有都差不多，然后self.off_diag_sum是要除以整个矩阵的和
+            # 是为了归一化，防止让这个损失偏移大小随batch_size的变化而变化，我们偏移的大小应该
+            # 尽量只和\alpha学习率和实际损失大小相关。
+            # 也就是主要理解(diff * self.off_diag).pow(2).sum()这部分就是每个TD误差的平方和
+            # 我们损失会让其越来越小也就是接近0,那么也就是希望TD误差的对角线处接近0
+            # 而非对角线我们会希望其尽可能大，其实应该是接近1,但是工程上好像要考虑别的所以是越大越好
             fb_offdiag = 0.5 * (diff * self.off_diag).pow(2).sum() / self.off_diag_sum
+            # 计算对角FB损失，这里diagonal是提取dim1=1,dim2=2维的对角线
+            # 元素，diff的形状为[E,K,K]取对角线后变成[E,K]
+            # 因为对角线元素next_obs[i]=goal[i]，我们会希望这个对角的TD误差
+            # 尽可能大，所以取平均然后取负值
             fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
             fb_loss = fb_offdiag + fb_diag
 
             # compute orthonormality loss for backward embedding
+            # B网络的正则损失，是为了能让状态编码保持多样性，避免大量状态被编码成相同的向量
+            # 这里的B已经是goal经过了B网络后的值
+            # B的规格是[K, z_dim]，然后经过matmul就是[K, K]，每个值表示这个向量和
+            # 另一个向量的范数大小，只有归一化后才能说相关性大小，因为相关性
+            # 除了看两个向量各自的长度，还看两个向量的夹角大小，不归一化的可能两个向量长度非常长
+            # 但夹角其实也很大，其实没那么相关却以为很相关。
             Cov = torch.matmul(B, B.T)
+            # 我们希望对角线方向尽可能大，其实这里就是希望自己和自己的相关性不能为0
             orth_loss_diag = -Cov.diag().mean()
+            # 让非对角线的内积尽可能小，也就是希望自己和别的向量尽可能不相关
+            # 这个损失应该很好理解
             orth_loss_offdiag = 0.5 * (Cov * self.off_diag).pow(2).sum() / self.off_diag_sum
             orth_loss = orth_loss_offdiag + orth_loss_diag
             fb_loss += self.cfg.train.ortho_coef * orth_loss
 
             q_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
+            # 这个就是经典的Q网络的损失了
             if q_loss_coef is not None:
                 with torch.no_grad():
                     next_Qs = (target_Fs * z).sum(dim=-1)  # num_parallel x batch
